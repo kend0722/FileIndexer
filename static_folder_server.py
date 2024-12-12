@@ -40,10 +40,9 @@ from multiprocessing import Process
 import mimetypes
 import io
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
+# # 配置日志
+# logging.basicConfig(level=logging.INFO)
 
 
 class StaticFileServer:
@@ -132,40 +131,44 @@ class StaticFileServer:
         :param request: 请求对象。
         :return: FileResponse 或 StreamingResponse。
         """
-        mime_type, _ = mimetypes.guess_type(full_path)
-        if mime_type is None:
-            if full_path.lower().endswith('.mp4'):
-                mime_type = 'video/mp4'
+        try:
+            mime_type, _ = mimetypes.guess_type(full_path)
+            if mime_type is None:
+                if full_path.lower().endswith('.mp4'):
+                    mime_type = 'video/mp4'
+                else:
+                    mime_type = 'application/octet-stream'
+
+            # 判断是否是图片或视频文件
+            is_image_or_video = mime_type and (mime_type.startswith("image/") or mime_type == 'video/mp4')
+
+            # 检查 URL 参数，判断是否需要内联显示
+            view_param = request.query_params.get('view', '').lower() == 'true'
+
+            if is_image_or_video and view_param:
+                # 如果是图片或视频文件，并且用户请求查看，则设置 Content-Disposition 为 inline
+                content_disposition = "inline"
             else:
-                mime_type = 'application/octet-stream'
+                # 默认情况下，所有文件都强制下载
+                content_disposition = "attachment"
 
-        # 判断是否是图片或视频文件
-        is_image_or_video = mime_type and (mime_type.startswith("image/") or mime_type == 'video/mp4')
+            range_header = request.headers.get('Range', None)
+            if range_header and mime_type == 'video/mp4':
+                return await self.range_file_response(full_path, range_header)
+            else:
+                headers = {
+                    "Cache-Control": "public, max-age=86400",  # 缓存一天
+                    "Content-Type": mime_type,  # 确保正确的 MIME 类型
+                    "Content-Disposition": f"{content_disposition}; filename={os.path.basename(full_path)}",
+                }
 
-        # 检查 URL 参数，判断是否需要内联显示
-        view_param = request.query_params.get('view', '').lower() == 'true'
-
-        if is_image_or_video and view_param:
-            # 如果是图片或视频文件，并且用户请求查看，则设置 Content-Disposition 为 inline
-            content_disposition = "inline"
-        else:
-            # 默认情况下，所有文件都强制下载
-            content_disposition = "attachment"
-
-        range_header = request.headers.get('Range', None)
-        if range_header and mime_type == 'video/mp4':
-            return await self.range_file_response(full_path, range_header)
-        else:
-            headers = {
-                "Cache-Control": "public, max-age=86400",  # 缓存一天
-                "Content-Type": mime_type,  # 确保正确的 MIME 类型
-                "Content-Disposition": f"{content_disposition}; filename={os.path.basename(full_path)}",
-            }
-
-            return FileResponse(
-                full_path,
-                headers=headers
-            )
+                return FileResponse(
+                    full_path,
+                    headers=headers
+                )
+        except Exception as e:
+            self.logger.error(f"Error serving file: {e}")
+            raise HTTPException(status_code=500, detail="Error serving file")
 
     async def range_file_response(self, full_path: str, range_header: str) -> StreamingResponse:
         """处理 MP4 文件的范围请求"""

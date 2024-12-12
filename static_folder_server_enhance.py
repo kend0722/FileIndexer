@@ -1,11 +1,13 @@
-import os
-import json
-from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-import multiprocessing
+# -*- coding: utf-8 -*-
+"""
+@Time    : 2024/07/16 下午11:03
+@Author  : Kend
+@FileName: static_folder_server.py
+@Software: PyCharm
+@modifier:
+"""
+
+
 
 
 """
@@ -24,6 +26,8 @@ import multiprocessing
     索引更新逻辑：包括检查六个月前的文件，删除并更新索引文件。
 """
 
+
+# TODO  显示的问题
 import os
 import json
 from datetime import datetime, timedelta
@@ -33,6 +37,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import multiprocessing
 import logging
+from fastapi import FastAPI, HTTPException, Query, Request
+from typing import Optional
 
 
 # 配置日志记录
@@ -47,12 +53,6 @@ class FileService:
         self.index = {}
         self.FILE_RETENTION_TIME = retention_time
         self.load_index()
-
-        # 设置定时任务，每天凌晨0点清理过期文件，0点5分更新索引
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.add_job(self.cleanup_old_files, CronTrigger(hour=0, minute=0))  # 每天0点0分执行
-        self.scheduler.add_job(self.update_index_task, CronTrigger(hour=0, minute=5))  # 每天0点5分更新索引
-        self.scheduler.start()
 
         # 启动时是否执行全量扫描
         if full_scan_on_startup:
@@ -178,7 +178,8 @@ class FileService:
         self.save_index()
         logger.info("Cleanup of old files completed.")
 
-    def serve_path(self, file_path: str, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+    def serve_path(self, file_path: str, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+                   inline: bool = False):
         """根据路径返回文件或目录"""
         # 规范化路径，确保路径格式一致
         file_path = os.path.normpath(file_path)
@@ -192,12 +193,13 @@ class FileService:
         if not os.path.commonpath([full_path, self.folder_path]) == self.folder_path:
             raise HTTPException(status_code=403, detail="Access denied")
 
-        # 如果请求的是根路径，列出根目录下的所有文件和子目录
-        if file_path == "":
+        # 如果请求的是根路径或子目录，列出目录下的所有文件和子目录
+        if file_path == "" or (file_path in self.index and self.index[file_path]["is_dir"]):
+            # 获取当前路径下的所有条目
             sub_items = [
-                (name, self.index[name]["is_dir"])
-                for name in self.index
-                if os.path.dirname(name) == ""  # 只列出根目录下的条目
+                (name, metadata["is_dir"])
+                for name, metadata in self.index.items()
+                if os.path.dirname(name) == file_path  # 只列出当前路径下的条目
             ]
             sub_items = sorted(sub_items, key=lambda x: x[0])
             start = (page - 1) * page_size
@@ -205,14 +207,14 @@ class FileService:
             paginated_files = sub_items[start:end]
 
             files_html = "\n".join(
-                f'<li><a href="/{name}">{name}</a></li>' for name, _ in paginated_files
+                f'<li><a href="/{os.path.join(file_path, name)}">{name}</a></li>' for name, _ in paginated_files
             )
             return HTMLResponse(
                 content=f"""
                 <html>
-                <head><title>Index of /</title></head>
+                <head><title>Index of /{file_path}</title></head>
                 <body>
-                    <h1>Index of /</h1>
+                    <h1>Index of /{file_path}</h1>
                     <ul>
                         {files_html}
                     </ul>
@@ -222,7 +224,7 @@ class FileService:
                 status_code=200,
             )
 
-        # 如果请求的是非根路径，检查该路径是否存在
+        # 如果请求的是非根路径且存在，检查该路径是否存在
         if file_path not in self.index:
             raise HTTPException(status_code=404, detail="File or directory not found")
 
@@ -230,9 +232,9 @@ class FileService:
         if metadata["is_dir"]:
             # 列出子目录或文件
             sub_items = [
-                (name, self.index[os.path.join(file_path, name)]["is_dir"])
-                for name in self.index
-                if os.path.dirname(name) == file_path
+                (name, metadata["is_dir"])
+                for name, metadata in self.index.items()
+                if os.path.dirname(name) == file_path  # 只列出当前路径下的条目
             ]
             sub_items = sorted(sub_items, key=lambda x: x[0])
             start = (page - 1) * page_size
@@ -259,27 +261,67 @@ class FileService:
         else:
             # 返回文件
             full_file_path = os.path.join(self.folder_path, file_path)
-            return FileResponse(full_file_path)
+
+            # 检查文件扩展名，判断是否为图像或视频
+            file_extension = os.path.splitext(full_file_path)[1].lower()
+            image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg']
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+
+            # 如果是图像或视频，默认下载文件
+            if file_extension in image_extensions + video_extensions:
+                if inline:
+                    # 如果用户选择了内联显示，则返回带有 Content-Disposition: inline 的响应
+                    return FileResponse(full_file_path, media_type=self.get_media_type(file_extension),
+                                        filename=os.path.basename(full_file_path))
+                else:
+                    # 默认返回带有 Content-Disposition: attachment 的响应，强制下载
+                    return FileResponse(full_file_path, media_type=self.get_media_type(file_extension),
+                                        filename=os.path.basename(full_file_path),
+                                        headers={"Content-Disposition": "attachment"})
+            else:
+                # 对于其他类型的文件，直接返回文件
+                return FileResponse(full_file_path)
+
+
+    def get_media_type(self, extension: str) -> str:
+        """根据文件扩展名返回 MIME 类型"""
+        media_types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp',
+            '.svg': 'image/svg+xml',
+            '.mp4': 'video/mp4',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.mkv': 'video/x-matroska'
+        }
+        return media_types.get(extension, 'application/octet-stream')
 
     def start(self):
         """启动服务"""
         app = FastAPI()
 
         @app.get("/{file_path:path}")
-        async def serve(file_path: str, page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+        async def serve(request: Request, file_path: str, page: int = Query(1, ge=1),
+                        page_size: int = Query(20, ge=1, le=100), inline: Optional[bool] = None):
             """服务文件和目录"""
-            return self.serve_path(file_path, page, page_size)
+            return self.serve_path(file_path, page, page_size, inline)
+
+        # 初始化并启动调度器
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(self.cleanup_old_files, CronTrigger(hour=0, minute=0))  # 每天0点0分执行
+        scheduler.add_job(self.update_index_task, CronTrigger(hour=0, minute=5))  # 每天0点5分更新索引
+        scheduler.start()
 
         from uvicorn import run
         run(app, host="127.0.0.1", port=8000)
-
 
     def run_in_process(self):
         """在单独的进程中启动文件服务"""
         process = multiprocessing.Process(target=self.start)
         process.start()
-
-
 
 # 示例用法
 if __name__ == "__main__":
